@@ -57,7 +57,8 @@ AI_CHOICES = {
     "copilot": "GitHub Copilot",
     "claude": "Claude Code",
     "gemini": "Gemini CLI",
-    "cursor": "Cursor"
+    "cursor": "Cursor",
+    "kilocode": "Kilo Code"
 }
 # Add script type choices
 SCRIPT_TYPE_CHOICES = {"sh": "POSIX Shell (bash/zsh)", "ps": "PowerShell"}
@@ -375,7 +376,7 @@ def is_git_repo(path: Path = None) -> bool:
     """Check if the specified path is inside a git repository."""
     if path is None:
         path = Path.cwd()
-    
+
     if not path.is_dir():
         return False
 
@@ -390,6 +391,21 @@ def is_git_repo(path: Path = None) -> bool:
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
+
+
+def get_repo_root() -> str:
+    """Get the absolute path to the repository root."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to current directory if not in a git repo
+        return str(Path.cwd())
 
 
 def init_git_repo(project_path: Path, quiet: bool = False) -> bool:
@@ -719,10 +735,87 @@ def ensure_executable_scripts(project_path: Path, tracker: StepTracker | None = 
                 console.print(f"  - {f}")
 
 
+def generate_kilocode_modes_from_templates(project_path: Path, script_type: str) -> None:
+    """Generate .kilocodemodes file by converting existing command templates to Kilo Code format."""
+    modes_file = project_path / ".kilocodemodes"
+
+    # Get absolute paths for scripts
+    repo_root = get_repo_root()
+    script_base = f"{repo_root}/.specify/scripts"
+    bash_script = f"{script_base}/bash" if script_type == "sh" else f"{script_base}/powershell"
+
+    # Command configurations with role definitions
+    command_configs = {
+        "specify": {
+            "name": "Specify",
+            "description": "Create feature specifications",
+            "role_definition": "You are Kilo Code, a feature specification expert specializing in converting natural language feature descriptions into structured, comprehensive specifications following spec-driven development principles.",
+            "when_to_use": "Use this mode when you need to convert a natural language feature description into a structured specification document with user stories, acceptance criteria, and technical requirements.",
+        },
+        "plan": {
+            "name": "Plan",
+            "description": "Implementation planning workflow",
+            "role_definition": "You are Kilo Code, an implementation planning expert who creates detailed technical plans from feature specifications, including architecture decisions, technology choices, and implementation phases.",
+            "when_to_use": "Use this mode when you need to generate implementation plans and design artifacts from feature specifications, including data models, API contracts, and research documentation.",
+        },
+        "tasks": {
+            "name": "Tasks",
+            "description": "Generate actionable task lists",
+            "role_definition": "You are Kilo Code, a task generation expert who breaks down implementation plans into dependency-ordered, actionable tasks with clear acceptance criteria.",
+            "when_to_use": "Use this mode when you need to create dependency-ordered task lists from design artifacts, breaking complex implementations into manageable, verifiable steps.",
+        }
+    }
+
+    custom_modes = []
+
+    for command_slug, config in command_configs.items():
+        # Read existing command template
+        template_file = project_path / ".specify" / "templates" / "commands" / f"{command_slug}.md"
+
+        if template_file.exists():
+            with open(template_file, 'r') as f:
+                template_content = f.read()
+
+            # Extract custom instructions from template (skip YAML frontmatter)
+            lines = template_content.split('\n')
+            custom_instructions = ""
+            in_frontmatter = False
+
+            for line in lines:
+                if line.strip() == '---':
+                    in_frontmatter = not in_frontmatter
+                    continue
+                if not in_frontmatter:
+                    custom_instructions += line + '\n'
+
+            # Replace template variables with actual paths
+            custom_instructions = custom_instructions.replace('{SCRIPT}', f'{bash_script}/{command_slug}.sh')
+            custom_instructions = custom_instructions.replace('{ARGS}', '$ARGUMENTS')
+            custom_instructions = custom_instructions.replace('repo root', f'{repo_root}')
+
+            mode_config = {
+                "slug": command_slug,
+                "name": config["name"],
+                "description": config["description"],
+                "roleDefinition": config["role_definition"],
+                "whenToUse": config["when_to_use"],
+                "groups": ["read", "edit", "command"],
+                "customInstructions": custom_instructions.strip()
+            }
+
+            custom_modes.append(mode_config)
+
+    modes_config = {"customModes": custom_modes}
+
+    # Write JSON file (uses built-in json module)
+    with open(modes_file, 'w') as f:
+        json.dump(modes_config, f, indent=2)
+
+
 @app.command()
 def init(
     project_name: str = typer.Argument(None, help="Name for your new project directory (optional if using --here)"),
-    ai_assistant: str = typer.Option(None, "--ai", help="AI assistant to use: claude, gemini, copilot, or cursor"),
+    ai_assistant: str = typer.Option(None, "--ai", help="AI assistant to use: claude, gemini, copilot, cursor, or kilocode"),
     script_type: str = typer.Option(None, "--script", help="Script type to use: sh or ps"),
     ignore_agent_tools: bool = typer.Option(False, "--ignore-agent-tools", help="Skip checks for AI agent tools like Claude Code"),
     no_git: bool = typer.Option(False, "--no-git", help="Skip git repository initialization"),
@@ -888,6 +981,22 @@ def init(
             # Ensure scripts are executable (POSIX)
             ensure_executable_scripts(project_path, tracker=tracker)
 
+            # Generate AI-specific integration files
+            if selected_ai == "kilocode":
+                generate_kilocode_modes_from_templates(project_path, selected_script)
+            elif selected_ai == "cursor":
+                # Existing cursor logic unchanged
+                cursor_commands_dir = project_path / ".cursor" / "commands"
+                cursor_commands_dir.mkdir(parents=True, exist_ok=True)
+
+                template_commands_dir = project_path / ".specify" / "templates" / "commands"
+                for cmd_file in ["specify.md", "plan.md", "tasks.md"]:
+                    src = template_commands_dir / cmd_file
+                    dst = cursor_commands_dir / cmd_file
+                    if src.exists():
+                        shutil.copy2(src, dst)
+            # Other AI assistants unchanged...
+
             # Git step
             if not no_git:
                 tracker.start("git")
@@ -950,6 +1059,8 @@ def init(
         steps_lines.append("   - See GEMINI.md for all available commands")
     elif selected_ai == "copilot":
         steps_lines.append(f"{step_num}. Open in Visual Studio Code and use [bold cyan]/specify[/], [bold cyan]/plan[/], [bold cyan]/tasks[/] commands with GitHub Copilot")
+    elif selected_ai == "kilocode":
+        steps_lines.append(f"{step_num}. Open in your IDE and use [bold cyan]/specify[/], [bold cyan]/plan[/], [bold cyan]/tasks[/] commands with Kilo Code")
 
     # Removed script variant step (scripts are transparent to users)
     step_num += 1
